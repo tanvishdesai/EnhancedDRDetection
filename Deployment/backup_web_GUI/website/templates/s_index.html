@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Diabetic Retinopathy Detection</title>
+    <style>
+      /* General styling */
+      body {
+        font-family: Arial, sans-serif;
+        background-color: #f4f7fa;
+        color: #333;
+        margin: 0;
+        padding: 0;
+      }
+
+      header {
+        background-color: #4caf50;
+        color: white;
+        text-align: center;
+        padding: 20px;
+      }
+
+      header nav {
+        margin-top: 10px;
+      }
+
+      header nav a {
+        color: white;
+        margin: 0 15px;
+        text-decoration: none;
+        font-weight: bold;
+      }
+
+      header nav a:hover {
+        text-decoration: underline;
+      }
+
+      /* Main content section */
+      .main-content {
+        display: flex;
+        flex-direction: row;
+        justify-content: space-around;
+        align-items: center;
+        padding: 50px;
+      }
+
+      .home-section {
+        flex: 1;
+        text-align: center;
+      }
+
+      .image-section {
+        flex: 1;
+        text-align: center;
+      }
+
+      .image-section img {
+        max-width: 100%;
+        height: auto;
+        border-radius: 10px;
+      }
+
+      .form-content {
+        display: none;
+        padding: 50px;
+        background-color: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        max-width: 600px;
+        margin: 0 auto;
+      }
+
+      .form-group {
+        margin-bottom: 15px;
+      }
+
+      .form-group label {
+        display: block;
+        margin-bottom: 5px;
+        font-weight: bold;
+      }
+
+      .form-group input,
+      .form-group select {
+        width: 100%;
+        padding: 10px;
+        font-size: 16px;
+        border: 1px solid #ccc;
+        border-radius: 5px;
+      }
+
+      .form-group input[type="file"] {
+        padding: 10px;
+        font-size: 14px;
+      }
+
+      button {
+        background-color: #4caf50;
+        color: white;
+        padding: 10px 20px;
+        font-size: 16px;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        transition: background-color 0.3s;
+      }
+
+      button:hover {
+        background-color: #45a049;
+      }
+
+      #prediction-result {
+        display: none;
+        margin-top: 20px;
+        text-align: center;
+      }
+
+      #prediction-result h3 {
+        color: #4caf50;
+      }
+
+      #prediction-result p {
+        font-size: 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Diabetic Retinopathy Detection</h1>
+      <nav>
+        <a href="#home">Home</a>
+        <a href="#about">About</a>
+      </nav>
+    </header>
+
+    <div class="main-content" id="home">
+      <div class="home-section">
+        <h2>Empowering Early Detection with AI</h2>
+        <p>
+          Leverage cutting-edge AI to detect diabetic retinopathy early and
+          prevent severe vision loss. This tool ensures accessibility, efficiency,
+          and reliability for all users.
+        </p>
+      </div>
+      <div class="image-section">
+        <img src="{{ url_for('static', filename='ai_detection.jpg') }}" alt="AI Detection" />
+        <button onclick="showPredictionForm()">Make Prediction</button>
+      </div>
+    </div>
+
+    <div class="form-content" id="prediction">
+      <h2>Get Results</h2>
+      <form id="prediction-form">
+        <div class="form-group">
+          <label for="image">Upload an Image:</label>
+          <input type="file" id="image" name="image" accept=".jpg, .jpeg" required onchange="clearPreviousPrediction()" />
+        </div>
+        <div class="form-group">
+          <label for="model">Select Model:</label>
+          <select id="model" name="model" required onchange="clearPreviousPrediction()">
+            <option value="" disabled selected>Select a Model</option>
+            <option value="model1">Ensemble Model</option>
+            <option value="model2">XGBoost Model</option>
+            <option value="model3">Keras Model</option>
+          </select>
+        </div>
+        <button type="submit">Make Prediction</button>
+      </form>
+      <div id="prediction-result" style="display: none;">
+        <h3>Prediction Result</h3>
+        <p id="result-text"></p>
+      </div>
+    </div>
+
+    <script>
+      function showPredictionForm() {
+        document.querySelector(".main-content").style.display = "none";
+        document.getElementById("prediction").style.display = "block";
+      }
+
+      function clearPreviousPrediction() {
+        // Clear the previous prediction result when either the image or model is changed
+        document.getElementById("prediction-result").style.display = "none";
+        document.getElementById("result-text").textContent = "";
+      }
+
+      document.getElementById("prediction-form").addEventListener("submit", async function (e) {
+        e.preventDefault();
+
+        const formData = new FormData(this);
+        const response = await fetch("/predict", {
+          method: "POST",
+          body: formData,
+        });
+
+        const result = await response.json();
+        if (result.error) {
+          alert(result.error);
+        } else {
+          const predictedClass = result.predicted_class;
+          const resultText =
+            predictedClass === 0
+              ? "No Diabetic Retinopathy Detected"
+              : predictedClass === 4
+              ? "Severe Diabetic Retinopathy Detected"
+              : "Mild Diabetic Retinopathy Detected";
+
+          document.getElementById("result-text").textContent = resultText;
+          document.getElementById("prediction-result").style.display = "block";
+        }
+      });
+    </script>
+  </body>
+</html>

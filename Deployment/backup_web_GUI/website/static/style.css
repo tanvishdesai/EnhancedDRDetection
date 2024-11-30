@@ -1,0 +1,118 @@
+ /* General styling */
+ body {
+    font-family: Arial, sans-serif;
+    background-color: #f4f7fa;
+    color: #333;
+    margin: 0;
+    padding: 0;
+  }
+
+  header {
+    background-color: #4caf50;
+    color: white;
+    text-align: center;
+    padding: 20px;
+  }
+
+  header nav {
+    margin-top: 10px;
+  }
+
+  header nav a {
+    color: white;
+    margin: 0 15px;
+    text-decoration: none;
+    font-weight: bold;
+  }
+
+  header nav a:hover {
+    text-decoration: underline;
+  }
+
+  /* Main content section */
+  .main-content {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-around;
+    align-items: center;
+    padding: 50px;
+  }
+
+  .home-section {
+    flex: 1;
+    text-align: center;
+  }
+
+  .image-section {
+    flex: 1;
+    text-align: center;
+  }
+
+  .image-section img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 10px;
+  }
+
+  .form-content {
+    display: none;
+    padding: 50px;
+    background-color: white;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    max-width: 600px;
+    margin: 0 auto;
+  }
+
+  .form-group {
+    margin-bottom: 15px;
+  }
+
+  .form-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: bold;
+  }
+
+  .form-group input,
+  .form-group select {
+    width: 100%;
+    padding: 10px;
+    font-size: 16px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+  }
+
+  .form-group input[type="file"] {
+    padding: 10px;
+    font-size: 14px;
+  }
+
+  button {
+    background-color: #4caf50;
+    color: white;
+    padding: 10px 20px;
+    font-size: 16px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+  }
+
+  button:hover {
+    background-color: #45a049;
+  }
+
+  #prediction-result {
+    display: none;
+    margin-top: 20px;
+    text-align: center;
+  }
+
+  #prediction-result h3 {
+    color: #4caf50;
+  }
+
+  #prediction-result p {
+    font-size: 18px;
+  }
