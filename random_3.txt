@@ -1,0 +1,260 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, models
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from torch.cuda.amp import GradScaler, autocast
+import optuna
+from optuna.integration import PyTorchIgniteTrial
+from ignite.engine import Engine, Events
+from ignite.handlers import ModelCheckpoint, EarlyStopping
+from ignite.metrics import RunningAverage
+
+# Configurations
+TRAIN_DATA_PATH = 'data/train_data.npz'
+VAL_DATA_PATH = 'data/val_data.npz'
+CHECKPOINT_DIR = 'checkpoints/'
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Dataset
+class RetinopathyDataset(Dataset):
+    def __init__(self, data_path, transform=None):
+        data = np.load(data_path)
+        self.images = data['images']
+        self.labels = data['labels']
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+def get_data_loader(data_path, batch_size, shuffle=True):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5])
+    ])
+    dataset = RetinopathyDataset(data_path, transform=transform)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=4,  # Enable pre-fetching
+        pin_memory=True  # Optimized for GPU
+    )
+
+# Model Components
+class BayesianDropout(nn.Dropout):
+    def __init__(self, p=0.5):
+        super(BayesianDropout, self).__init__(p=p)
+
+    def forward(self, input):
+        return super().forward(input)
+
+class ChannelAttention(nn.Module):
+    """Channel Attention Mechanism"""
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.fc2 = nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.global_avg_pool(x)
+        avg_out = self.fc2(torch.relu(self.fc1(avg_out)))
+        return x * self.sigmoid(avg_out)
+
+class FPN(nn.Module):
+    """Feature Pyramid Network"""
+    def __init__(self, in_channels_list, out_channels):
+        super(FPN, self).__init__()
+        self.lateral_convs = nn.ModuleList([nn.Conv2d(in_ch, out_channels, kernel_size=1) for in_ch in in_channels_list])
+        self.fpn_convs = nn.ModuleList([nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1) for _ in in_channels_list])
+
+    def forward(self, features):
+        # Build top-down path
+        fpn_features = [self.lateral_convs[-1](features[-1])]
+        for i in range(len(features) - 2, -1, -1):
+            lateral_feat = self.lateral_convs[i](features[i])
+            fpn_features.append(lateral_feat + nn.functional.interpolate(fpn_features[-1], scale_factor=2, mode='nearest'))
+
+        fpn_features.reverse()
+        fpn_features = [self.fpn_convs[i](fpn_features[i]) for i in range(len(fpn_features))]
+        return torch.cat(fpn_features, dim=1)  # Concatenate features
+
+class CustomModel(nn.Module):
+    def __init__(self, backbone, in_channels_list, dropout_rate=0.5, fpn_out_channels=256):
+        super(CustomModel, self).__init__()
+        self.backbone = backbone
+        self.fpn = FPN(in_channels_list, fpn_out_channels)
+        self.attention = ChannelAttention(fpn_out_channels * len(in_channels_list))
+        self.fc = nn.Linear(fpn_out_channels * len(in_channels_list), 5)
+        self.dropout = BayesianDropout(p=dropout_rate)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        fpn_features = self.fpn(features)
+        attention_features = self.attention(fpn_features)
+        pooled = torch.flatten(torch.nn.functional.adaptive_avg_pool2d(attention_features, (1, 1)), 1)
+        pooled = self.dropout(pooled)
+        return self.fc(pooled)
+
+class EnsembleModel(nn.Module):
+    def __init__(self, models):
+        super(EnsembleModel, self).__init__()
+        self.models = models
+
+    def forward(self, x, mc_samples=10):
+        outputs = []
+        for _ in range(mc_samples):
+            preds = torch.stack([model(x) for model in self.models])
+            outputs.append(preds.mean(dim=0))
+        return torch.stack(outputs).mean(dim=0)
+
+def get_resnet_backbone():
+    model = models.resnet18(pretrained=True)
+    return nn.Sequential(*list(model.children())[:-2]), [64, 128, 256, 512]
+
+def get_vgg_backbone():
+    model = models.vgg16(pretrained=True)
+    return nn.Sequential(*list(model.children())[:-2]), [64, 128, 256, 512, 512]
+
+# Hyperparameter Tuning
+def objective(trial):
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    learning_rate = trial.suggest_loguniform("learning_rate", 1e-6, 1e-4)
+    dropout_rate = trial.suggest_uniform("dropout_rate", 0.1, 0.5)
+    fpn_out_channels = trial.suggest_categorical("fpn_out_channels", [128, 256, 512])
+
+    train_loader = get_data_loader(TRAIN_DATA_PATH, batch_size)
+    val_loader = get_data_loader(VAL_DATA_PATH, batch_size, shuffle=False)
+
+    backbones = [
+        get_resnet_backbone(),
+        get_vgg_backbone()
+    ]
+    models = [CustomModel(backbone[0], backbone[1], dropout_rate=dropout_rate, fpn_out_channels=fpn_out_channels).to(DEVICE) for backbone in backbones]
+    ensemble_model = EnsembleModel(models).to(DEVICE)
+
+    optimizer = optim.AdamW(ensemble_model.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(10):
+        ensemble_model.train()
+        optimizer.zero_grad()
+
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+            outputs = ensemble_model(images)
+            loss = criterion(outputs, labels)
+
+            loss.backward()
+            optimizer.step()
+
+        ensemble_model.eval()
+        val_loss = 0
+        correct = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = ensemble_model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                correct += (predicted == labels).sum().item()
+
+        accuracy = correct / len(val_loader.dataset)
+        print(f'Epoch {epoch+1}, Val Loss: {val_loss / len(val_loader)}')
+        print(f'Epoch {epoch+1}, Val Acc: {accuracy:.2f}')
+
+    return -accuracy
+
+# Perform hyperparameter tuning
+study = optuna.create_study(direction='maximize')
+n_trials = 10
+study.optimize(objective, n_trials=n_trials)
+
+# Train the model with the best hyperparameters
+best_params = study.best_trial.params
+print(f'Best Parameters: {best_params}')
+
+train_loader = get_data_loader(TRAIN_DATA_PATH, best_params['batch_size'])
+val_loader = get_data_loader(VAL_DATA_PATH, best_params['batch_size'], shuffle=False)
+
+backbones = [
+    get_resnet_backbone(),
+    get_vgg_backbone()
+]
+models = [CustomModel(backbone[0], backbone[1], dropout_rate=best_params['dropout_rate'], fpn_out_channels=best_params['fpn_out_channels']).to(DEVICE) for backbone in backbones]
+ensemble_model = EnsembleModel(models).to(DEVICE)
+
+optimizer = optim.AdamW(ensemble_model.parameters(), lr=best_params['learning_rate'])
+criterion = nn.CrossEntropyLoss()
+
+# Training Loop
+for epoch in range(10):
+    ensemble_model.train()
+    optimizer.zero_grad()
+
+    for batch_idx, (images, labels) in enumerate(train_loader):
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+        outputs = ensemble_model(images)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+    ensemble_model.eval()
+    val_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = ensemble_model(images)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+                 correct += (predicted == labels).sum().item()
+
+        accuracy = correct / len(val_loader.dataset)
+        print(f'Epoch {epoch+1}, Val Loss: {val_loss / len(val_loader)}')
+        print(f'Epoch {epoch+1}, Val Acc: {accuracy:.2f}')
+
+# Model Evaluation
+def evaluate_model(model, data_loader):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for images, labels in data_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    auc_score = roc_auc_score(all_labels, all_preds, multi_class='ovr')
+    f1_score_value = f1_score(all_labels, all_preds, average='macro')
+    precision_score_value = precision_score(all_labels, all_preds, average='macro')
+    recall_score_value = recall_score(all_labels, all_preds, average='macro')
+    print(f'Accuracy: {accuracy:.4f}')
+    print(f'AUC Score: {auc_score:.4f}')
+    print(f'F1 Score: {f1_score_value:.4f}')
+    print(f'Precision Score: {precision_score_value:.4f}')
+    print(f'Recall Score: {recall_score_value:.4f}')
+    print(f'Classification Report:\n{classification_report(all_labels, all_preds)}')
+
+# Evaluate the model
+evaluate_model(ensemble_model, val_loader)

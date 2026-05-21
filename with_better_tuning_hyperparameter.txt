@@ -1,0 +1,213 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, Subset
+from sklearn.model_selection import KFold
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from torchvision import transforms, models
+from torch.cuda.amp import GradScaler, autocast
+import optuna
+from optuna.integration import PyTorchIgniteTrial
+from torchvision import transforms
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.swa_utils import AveragedModel, update_bn
+import torch.nn.functional as F
+
+# Configurations
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_CLASSES = 5
+DATA_PATH = 'data/dataset.npz'
+BACKBONE_WEIGHTS = {
+    'efficientnet': 'weights/efficientnet.pth',
+    'resnet': 'weights/resnet.pth',
+    'vgg': 'weights/vgg.pth'
+}
+CHECKPOINT_DIR = 'checkpoints/'
+KFOLD_SPLITS = 5
+BATCH_SIZE = 32
+NUM_EPOCHS = 10
+LR = 1e-4
+
+# Dataset
+class RetinopathyDataset(Dataset):
+    def __init__(self, data_path, transform=None):
+        data = np.load(data_path)
+        self.images = data['images']
+        self.labels = data['labels']
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+# Data Augmentation
+data_transforms = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=30),
+    transforms.RandomResizedCrop(512, scale=(0.8, 1.2), ratio=(0.8, 1.2)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
+
+def get_data_loader(dataset, indices, batch_size, shuffle=True):
+    subset = Subset(dataset, indices)
+    return DataLoader(subset, batch_size=batch_size, shuffle=shuffle, num_workers=4, pin_memory=True)
+
+# Components
+class BayesianDropout(nn.Dropout):
+    def __init__(self, p=0.5):
+        super(BayesianDropout, self).__init__(p=p)
+
+    def forward(self, input):
+        return super().forward(input)
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.fc2 = nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.global_avg_pool(x)
+        avg_out = self.fc2(torch.relu(self.fc1(avg_out)))
+        return x * self.sigmoid(avg_out)
+
+class FPN(nn.Module):
+    def __init__(self, in_channels_list, out_channels):
+        super(FPN, self).__init__()
+        self.lateral_convs = nn.ModuleList([nn.Conv2d(in_ch, out_channels, kernel_size=1) for in_ch in in_channels_list])
+        self.fpn_convs = nn.ModuleList([nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1) for _ in in_channels_list])
+
+    def forward(self, features):
+        fpn_features = [self.lateral_convs[-1](features[-1])]
+        for i in range(len(features) - 2, -1, -1):
+            lateral_feat = self.lateral_convs[i](features[i])
+            fpn_features.append(lateral_feat + nn.functional.interpolate(fpn_features[-1], scale_factor=2, mode='nearest'))
+
+        fpn_features.reverse()
+        fpn_features = [self.fpn_convs[i](fpn_features[i]) for i in range(len(fpn_features))]
+        return torch.cat(fpn_features, dim=1)
+
+class CustomModel(nn.Module):
+    def __init__(self, backbone, in_channels_list, dropout_rate=0.5, fpn_out_channels=256):
+        super(CustomModel, self).__init__()
+        self.backbone = backbone
+        self.fpn = FPN(in_channels_list, fpn_out_channels)
+        self.attention = ChannelAttention(fpn_out_channels * len(in_channels_list))
+        self.fc = nn.Linear(fpn_out_channels * len(in_channels_list), NUM_CLASSES)
+        self.dropout = BayesianDropout(p=dropout_rate)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        fpn_features = self.fpn(features)
+        attention_features = self.attention(fpn_features)
+        pooled = torch.flatten(torch.nn.functional.adaptive_avg_pool2d(attention_features, (1, 1)), 1)
+        pooled = self.dropout(pooled)
+        return self.fc(pooled)
+
+class EnsembleModel(nn.Module):
+    def __init__(self, models):
+        super(EnsembleModel, self).__init__()
+        self.models = models
+
+    def forward(self, x, mc_samples=10):
+        outputs = []
+        for _ in range(mc_samples):
+            preds = torch.stack([model(x) for model in self.models])
+            outputs.append(preds.mean(dim=0))
+        return torch.stack(outputs).mean(dim=0)
+
+def load_backbone(backbone_name):
+    backbone_mapping = {
+        'efficientnet': (models.efficientnet_b7, 'weights/efficientnet.pth'),
+        'resnet': (models.resnet152, 'weights/resnet.pth'),
+        'vgg': (models.vgg19_bn, 'weights/vgg.pth')
+    }
+
+    model_class, weight_path = backbone_mapping[backbone_name]
+    model = model_class(pretrained=True)
+    model.load_state_dict(torch.load(weight_path, map_location=DEVICE))
+    return nn.Sequential(*list(model.children())[:-2]), [64, 128, 256, 512]
+
+def train(model, device, loader, optimizer, criterion, epoch):
+    model.train()
+    for batch_idx, (data, target) in enumerate(loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+        if batch_idx % 10 == 0:
+            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(loader.dataset)} ({100. * batch_idx / len(loader):.0f}%)]\tLoss: {loss.item():.6f}')
+
+def evaluate(model, device, loader, criterion):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += criterion(output, target).item()
+            _, predicted = torch.max(output, 1)
+            correct += (predicted == target).sum().item()
+
+    test_loss /= len(loader.dataset)
+    print(f'\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(loader.dataset)} ({100. * correct / len(loader.dataset):.0f}%)\n')
+
+# K-Fold Cross-Validation
+def k_fold_cross_validation(data_path, num_splits=KFOLD_SPLITS):
+    dataset = RetinopathyDataset(data_path, transform=data_transforms)
+    kfold = KFold(n_splits=num_splits, shuffle=True)
+
+    results = []
+    for fold, (train_indices, val_indices) in enumerate(kfold.split(dataset)):
+        print(f"Fold {fold+1}/{num_splits}")
+        train_loader = get_data_loader(dataset, train_indices, BATCH_SIZE)
+        val_loader = get_data_loader(dataset, val_indices, BATCH_SIZE, shuffle=False)
+
+        backbones = [
+            load_backbone('efficientnet'),
+            load_backbone('resnet'),
+            load_backbone('vgg')
+        ]
+        models = [CustomModel(backbone[0], backbone[1]).to(DEVICE) for backbone in backbones]
+        ensemble_model = EnsembleModel(models).to(DEVICE)
+
+        optimizer = optim.AdamW(ensemble_model.parameters(), lr=LR)
+        scheduler = OneCycleLR(optimizer, max_lr=LR, steps_per_epoch=len(train_loader), epochs=NUM_EPOCHS)
+        criterion = nn.CrossEntropyLoss()
+
+        best_val_loss = float('inf')
+        best_val_acc = 0
+        for epoch in range(NUM_EPOCHS):
+            train(ensemble_model, DEVICE, train_loader, optimizer, criterion, epoch)
+            val_loss, val_acc = evaluate(ensemble_model, DEVICE, val_loader, criterion)
+            scheduler.step()
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_val_acc = val_acc
+                torch.save(ensemble_model.state_dict(), os.path.join(CHECKPOINT_DIR, f"best_model_fold_{fold+1}.pth"))
+
+        print(f"Best Val Loss: {best_val_loss:.4f}, Best Val Acc: {best_val_acc:.4f}")
+        results.append((best_val_loss, best_val_acc))
+
+    print("K-Fold Cross-Validation Results:")
+    for i, (val_loss, val_acc) in enumerate(results):
+        print(f"Fold {i+1}: Val Loss = {val_loss:.4f}, Val Acc = {val_acc:.4f}")
+
+# Run K-Fold Cross-Validation
+k_fold_cross_validation(DATA_PATH)

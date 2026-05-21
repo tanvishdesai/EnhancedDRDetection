@@ -1,0 +1,288 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, Subset
+from sklearn.model_selection import KFold
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from torchvision import transforms, models
+import optuna
+from torch.cuda.amp import GradScaler, autocast
+
+# Configurations
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_CLASSES = 5
+TRAIN_DATA_PATH = 'data/train_data.npz'
+VAL_DATA_PATH = 'data/val_data.npz'
+CHECKPOINT_DIR = 'checkpoints/'
+
+# Dataset
+class RetinopathyDataset(Dataset):
+    def __init__(self, data_path, transform=None):
+        data = np.load(data_path)
+        self.images = data['images']
+        self.labels = data['labels']
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+# Data Augmentation and Normalization
+def get_transforms(is_train=True):
+    if is_train:
+        return transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=30),
+            transforms.RandomResizedCrop(512, scale=(0.8, 1.2), ratio=(0.8, 1.2)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+    else:
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+
+def get_data_loader(data_path, batch_size, is_train=True, shuffle=True):
+    transform = get_transforms(is_train)
+    dataset = RetinopathyDataset(data_path, transform=transform)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=4,
+        pin_memory=True
+    )
+
+# Model Components (Same as previous implementation)
+class BayesianDropout(nn.Dropout):
+    def __init__(self, p=0.5):
+        super(BayesianDropout, self).__init__(p=p)
+
+    def forward(self, input):
+        return super().forward(input)
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.fc2 = nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.global_avg_pool(x)
+        avg_out = self.fc2(torch.relu(self.fc1(avg_out)))
+        return x * self.sigmoid(avg_out)
+
+class FPN(nn.Module):
+    def __init__(self, in_channels_list, out_channels):
+        super(FPN, self).__init__()
+        self.lateral_convs = nn.ModuleList([nn.Conv2d(in_ch, out_channels, kernel_size=1) for in_ch in in_channels_list])
+        self.fpn_convs = nn.ModuleList([nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1) for _ in in_channels_list])
+
+    def forward(self, features):
+        fpn_features = [self.lateral_convs[-1](features[-1])]
+        for i in range(len(features) - 2, -1, -1):
+            lateral_feat = self.lateral_convs[i](features[i])
+            fpn_features.append(lateral_feat + nn.functional.interpolate(fpn_features[-1], scale_factor=2, mode='nearest'))
+
+        fpn_features.reverse()
+        fpn_features = [self.fpn_convs[i](fpn_features[i]) for i in range(len(fpn_features))]
+        return torch.cat(fpn_features, dim=1)
+
+class CustomModel(nn.Module):
+    def __init__(self, backbone, in_channels_list, dropout_rate=0.5, fpn_out_channels=256):
+        super(CustomModel, self).__init__()
+        self.backbone = backbone
+        self.fpn = FPN(in_channels_list, fpn_out_channels)
+        self.attention = ChannelAttention(fpn_out_channels * len(in_channels_list))
+        self.fc = nn.Linear(fpn_out_channels * len(in_channels_list), NUM_CLASSES)
+        self.dropout = BayesianDropout(p=dropout_rate)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        fpn_features = self.fpn(features)
+        attention_features = self.attention(fpn_features)
+        pooled = torch.flatten(torch.nn.functional.adaptive_avg_pool2d(attention_features, (1, 1)), 1)
+        pooled = self.dropout(pooled)
+        return self.fc(pooled)
+
+class EnsembleModel(nn.Module):
+    def __init__(self, models):
+        super(EnsembleModel, self).__init__()
+        self.models = models
+
+    def forward(self, x, mc_samples=10):
+        outputs = []
+        for _ in range(mc_samples):
+            preds = torch.stack([model(x) for model in self.models])
+            outputs.append(preds.mean(dim=0))
+        return torch.stack(outputs).mean(dim=0)
+
+def load_backbone(backbone_name):
+    backbone_mapping = {
+        'efficientnet': (models.efficientnet_b7, [64, 128, 256, 512]),
+        'resnet': (models.resnet152, [64, 128, 256, 512]),
+        'vgg': (models.vgg19_bn, [64, 128, 256, 512, 512])
+    }
+
+    model_class, channels = backbone_mapping[backbone_name]
+    model = model_class(pretrained=True)
+    return nn.Sequential(*list(model.children())[:-2]), channels
+
+# Hyperparameter Optimization
+def objective(trial):
+    # Hyperparameter suggestions
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    learning_rate = trial.suggest_loguniform("learning_rate", 1e-6, 1e-4)
+    dropout_rate = trial.suggest_uniform("dropout_rate", 0.1, 0.5)
+    fpn_out_channels = trial.suggest_categorical("fpn_out_channels", [128, 256, 512])
+    num_epochs = trial.suggest_int("num_epochs", 5, 15)
+
+    # Prepare data
+    train_loader = get_data_loader(TRAIN_DATA_PATH, batch_size, is_train=True)
+    val_loader = get_data_loader(VAL_DATA_PATH, batch_size, is_train=False, shuffle=False)
+
+    # Create ensemble of models
+    backbones = [
+        load_backbone('efficientnet'),
+        load_backbone('resnet'),
+        load_backbone('vgg')
+    ]
+    models = [CustomModel(backbone[0], backbone[1], dropout_rate=dropout_rate, fpn_out_channels=fpn_out_channels).to(DEVICE) for backbone in backbones]
+    ensemble_model = EnsembleModel(models).to(DEVICE)
+
+    # Optimizer and Loss
+    optimizer = optim.AdamW(ensemble_model.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    # Training Loop
+    best_val_accuracy = 0
+    for epoch in range(num_epochs):
+        ensemble_model.train()
+        for images, labels in train_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = ensemble_model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        # Validation
+        ensemble_model.eval()
+        val_loss = 0
+        correct = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = ensemble_model(images)
+                val_loss += criterion(outputs, labels).item()
+                _, predicted = torch.max(outputs, 1)
+                correct += (predicted == labels).sum().item()
+
+        val_accuracy = correct / len(val_loader.dataset)
+        best_val_accuracy = max(best_val_accuracy, val_accuracy)
+
+    return best_val_accuracy
+
+# Model Evaluation Function
+def evaluate_model(model, data_loader, title="Evaluation"):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for images, labels in data_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    # Comprehensive Metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    auc_score = roc_auc_score(all_labels, all_preds, multi_class='ovr')
+    f1_score_value = f1_score(all_labels, all_preds, average='macro')
+    precision_score_value = precision_score(all_labels, all_preds, average='macro')
+    recall_score_value = recall_score(all_labels, all_preds, average='macro')
+
+    print(f"{title} Metrics:")
+    print(f'Accuracy: {accuracy:.4f}')
+    print(f'AUC Score: {auc_score:.4f}')
+    print(f'F1 Score: {f1_score_value:.4f}')
+    print(f'Precision Score: {precision_score_value:.4f}')
+    print(f'Recall Score: {recall_score_value:.4f}')
+    print(f'Classification Report:\n{classification_report(all_labels, all_preds)}')
+
+    return {
+        'accuracy': accuracy,
+        'auc_score': auc_score,
+        'f1_score': f1_score_value,
+        'precision': precision_score_value,
+        'recall': recall_score_value
+    }
+
+# Hyperparameter Tuning
+def perform_hyperparameter_tuning():
+    study = optuna.create_study(direction='maximize')
+    n_trials = 20  # Increased number of trials
+    study.optimize(objective, n_trials=n_trials)
+
+    print("Best Hyperparameters:")
+    best_params = study.best_trial.params
+    for param, value in best_params.items():
+        print(f"{param}: {value}")
+
+    return best_params
+
+# Main Execution
+def main():
+    # Hyperparameter Tuning
+    best_params = perform_hyperparameter_tuning()
+
+    # Prepare data with best hyperparameters
+    train_loader = get_data_loader(TRAIN_DATA_PATH, best_params['batch_size'], is_train=True)
+    val_loader = get_data_loader(VAL_DATA_PATH, best_params['batch_size'], is_train=False, shuffle=False)
+
+    # Create final model
+    backbones = [
+        load_backbone('efficifocalentnet'),
+        load_backbone('resnet'),
+        load_backbone('vgg')
+    ]
+    models = [CustomModel(backbone[0], backbone[1], 
+                          dropout_rate=best_params['dropout_rate'], 
+                          fpn_out_channels=best_params['fpn_out_channels']).to(DEVICE) 
+              for backbone in backbones]
+    ensemble_model = EnsembleModel(models).to(DEVICE)
+
+    # Final Training
+    optimizer = optim.AdamW(ensemble_model.parameters(), lr=best_params['learning_rate'])
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(best_params.get('num_epochs', 10)):
+        ensemble_model.train()
+        for images, labels in train_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = ensemble_model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+    # Comprehensive Evaluation
+    evaluate_model(ensemble_model, train_loader, "Training Set")
+    evaluate_model(ensemble_model, val_loader, "Validation Set")
+
+if __name__ == "__main__":
+    main()

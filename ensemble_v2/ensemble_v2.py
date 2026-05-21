@@ -234,16 +234,3 @@ submission_df.to_csv('test_predictions.csv', index=False)
 print('Predictions saved to test_predictions.csv')
 
 # Grad-CAM Example (visualization for one image)
-grad_cam = GradCAM(model=ensemble_model, target_layer=ensemble_model.backbone.layer4)
-
-# Visualizing Grad-CAM for a test image (choose an image index)
-sample_image, _ = test_dataset[0]
-sample_image = sample_image.unsqueeze(0).to(device)
-output = ensemble_model(sample_image)
-class_idx = torch.argmax(output, dim=1).item()
-heatmap = grad_cam.generate_heatmap(sample_image, class_idx)
-
-# Visualizing the heatmap on the image
-plt.imshow(heatmap.squeeze().cpu(), cmap='jet', alpha=0.5)
-plt.imshow(sample_image.squeeze().cpu().permute(1, 2, 0).numpy(), alpha=0.5)
-plt.show()
